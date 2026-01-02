@@ -37,9 +37,25 @@ class StockNewsBot:
             listing = fdr.StockListing("NASDAQ")
             print(f"listing: {listing}")
             self.listing = listing.set_index("Symbol") if not listing.empty else None
+            self.nasdaq_symbols = set(listing["Symbol"].astype(str).str.upper()) if not listing.empty else set()
         except Exception as e:
             print(f"상장 종목 목록 조회 실패 (FinanceDataReader): {e}")
             self.listing = None
+            self.nasdaq_symbols = set()
+
+        try:
+            nyse_listing = fdr.StockListing("NYSE")
+            self.nyse_symbols = set(nyse_listing["Symbol"].astype(str).str.upper()) if not nyse_listing.empty else set()
+        except Exception as e:
+            print(f"NYSE 상장 목록 조회 실패 (FinanceDataReader): {e}")
+            self.nyse_symbols = set()
+
+        try:
+            krx_listing = fdr.StockListing("KRX")
+            self.krx_symbols = set(krx_listing["Symbol"].astype(str)) if not krx_listing.empty else set()
+        except Exception as e:
+            print(f"KRX 상장 목록 조회 실패 (FinanceDataReader): {e}")
+            self.krx_symbols = set()
 
     def load_interest_stocks(self):
         try:
@@ -65,6 +81,15 @@ class StockNewsBot:
         except Exception as e:
             print(f"티커 {ticker} DataReader 조회 실패: {e}")
             return False
+
+    def get_currency_symbol(self, ticker: str) -> str:
+        """나스닥은 달러, 코스피/코스닥은 원화 표기"""
+        ticker_upper = str(ticker).upper()
+        if ticker_upper in self.nasdaq_symbols or ticker_upper in self.nyse_symbols:
+            return "$"
+        if ticker in self.krx_symbols or ticker.isdigit():
+            return "원"
+        return "원"
 
     # 핸들러들
     async def add_stock(self, update, context: ContextTypes.DEFAULT_TYPE):
@@ -149,33 +174,55 @@ class StockNewsBot:
             return ticker
 
     def get_stock_news(self, ticker) -> Optional[list]:
-        """네이버 금융 뉴스 크롤링"""
+        """네이버 금융 뉴스 크롤링 (KRX / NASDAQ / NYSE 구분)"""
         try:
-            url = f"https://stock.naver.com/api/domestic/detail/news?itemCode={ticker}"
-            params = {
-                "page": 1,
-                "pageSize": 1
-            }
-            headers = {
-                "User-Agent": "Mozilla/5.0",
-                "Referer": f"https://stock.naver.com/domestic/stock/{ticker}/news"
-            }
+            ticker_upper = str(ticker).upper()
+            is_nasdaq = ticker_upper in self.nasdaq_symbols
+            is_nyse = ticker_upper in self.nyse_symbols
 
-            resp = requests.get(url, headers=headers, params=params, timeout=10)
-            resp.raise_for_status()
+            if is_nasdaq or is_nyse:
+                suffix = '.O' if is_nasdaq else '.K'
+                reuters_code = f"{ticker_upper}{suffix}"
+                url = "https://stock.naver.com/api/foreign/worldStock/list"
+                params = {"reutersCode": reuters_code, "page": 1, "pageSize": 1}
+                headers = {
+                    "User-Agent": "Mozilla/5.0",
+                    "Referer": f"https://stock.naver.com/worldstock/stock/{reuters_code}/worldnews",
+                }
+                resp = requests.get(url, headers=headers, params=params, timeout=10)
+                resp.raise_for_status()
 
-            data = resp.json()
-            news_list = data['clusters']
-            news_info_list = []
-            for news in news_list:
-                first_news = news["items"][0]
-                news_info_list.append({
-                    "title": first_news["title"],
-                    "officeId": first_news["officeId"],
-                    "articleId": first_news["articleId"],
-                    "url": f"https://n.news.naver.com/article/{first_news['officeId']}/{first_news['articleId']}"
-                })
-            # pprint(f"tem_list: {tem_list}")
+                news_list = resp.json()
+                news_info_list = []
+                for news in news_list:
+                    news_list = news.get("aid")
+                    news_info_list.append({
+                        "title": news["tit"],
+                        "aid": news["aid"],
+                        "url": f"https://stock.naver.com/worldstock/stock/{ticker_upper}.O/worldnews/fnGuide/{news['aid']}",
+                    })
+            else:
+                url = "https://stock.naver.com/api/domestic/detail/news"
+                params = {"itemCode": ticker, "page": 1, "pageSize": 1}
+                headers = {
+                    "User-Agent": "Mozilla/5.0",
+                    "Referer": f"https://stock.naver.com/domestic/stock/{ticker}/news",
+                }
+
+                resp = requests.get(url, headers=headers, params=params, timeout=10)
+                resp.raise_for_status()
+
+                data = resp.json()
+                news_list = data.get("clusters") or []
+                news_info_list = []
+                for news in news_list:
+                    first_news = news["items"][0] # 관련기사까지 묶여있어서 첫기사만 가져옴
+                    news_info_list.append({
+                        "title": first_news["title"],
+                        "officeId": first_news["officeId"],
+                        "articleId": first_news["articleId"],
+                        "url": f"https://n.news.naver.com/article/{first_news['officeId']}/{first_news['articleId']}",
+                    })
             return news_info_list
         except Exception as e:
             print(f"뉴스 조회 실패: {e}")
@@ -247,9 +294,14 @@ class StockNewsBot:
                 continue
 
             emoji = "🔴" if info["change_rate"] < 0 else "🟢" if info["change_rate"] > 0 else "⚪"
+            currency_symbol = self.get_currency_symbol(ticker)
+            if currency_symbol == "$":
+                price_text = f"{currency_symbol}{info['close']:,.2f}"
+            else:
+                price_text = f"{info['close']:,}{currency_symbol}"
 
             report += f"\n{emoji} {info['name']} ({ticker})\n"
-            report += f"종가: {info['close']:,}원 ({info['change_rate']:+.2f}%)\n"
+            report += f"종가: {price_text} ({info['change_rate']:+.2f}%)\n"
 
             news_list = self.get_stock_news(ticker)
 
