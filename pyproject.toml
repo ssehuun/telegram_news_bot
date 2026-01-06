@@ -8,6 +8,7 @@ dependencies = [
     "bs4>=0.0.2",
     "finance-datareader>=0.9.100",
     "openai>=2.14.0",
+    "pandas>=2.3.3",
     "python-dotenv>=1.2.1",
     "python-telegram-bot>=22.5",
     "requests>=2.32.5",

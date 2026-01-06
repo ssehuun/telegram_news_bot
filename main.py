@@ -2,11 +2,12 @@ import asyncio
 import json
 import os
 from datetime import datetime, timedelta
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Set
 from zoneinfo import ZoneInfo
 
-import FinanceDataReader as fdr
+import pandas as pd
 import requests
+import FinanceDataReader as fdr
 from dotenv import load_dotenv
 from openai import OpenAI
 from telegram import Bot
@@ -32,10 +33,16 @@ class StockNewsBot:
         self.stock_info_cache: Dict[str, Dict[str, Any]] = {}
         self.interest_stocks = self.load_interest_stocks()
         self.application: Optional[Application] = None
+        self.listing = None
+        # self.nasdaq_symbols: Set[str] = set()
+        # self.nyse_symbols: Set[str] = set()
+        self.krx_codes: Set[str] = set()
+        self.krx_name_to_code: Dict[str, str] = {}
+        self.krx_code_to_name: Dict[str, str] = {}
 
+        """
         try:
             listing = fdr.StockListing("NASDAQ")
-            print(f"listing: {listing}")
             self.listing = listing.set_index("Symbol") if not listing.empty else None
             self.nasdaq_symbols = set(listing["Symbol"].astype(str).str.upper()) if not listing.empty else set()
         except Exception as e:
@@ -49,24 +56,64 @@ class StockNewsBot:
         except Exception as e:
             print(f"NYSE 상장 목록 조회 실패 (FinanceDataReader): {e}")
             self.nyse_symbols = set()
+        """
 
-        try:
-            krx_listing = fdr.StockListing("KRX")
-            self.krx_symbols = set(krx_listing["Symbol"].astype(str)) if not krx_listing.empty else set()
-        except Exception as e:
-            print(f"KRX 상장 목록 조회 실패 (FinanceDataReader): {e}")
-            self.krx_symbols = set()
+        skip_krx_listing = os.getenv("SKIP_KRX_LISTING", "").lower() in {"1", "true", "yes"}
+        if skip_krx_listing:
+            print("환경 설정으로 KRX 상장 목록 조회를 건너뜁니다 (SKIP_KRX_LISTING).")
+        else:
+            try:
+                krx_listing = pd.read_csv('file/data_0147_20260105.csv', encoding='euc-kr')
+                if not krx_listing.empty:
+                    # 종목명/코드 양방향 매핑을 생성해 한글명 검색을 지원한다.
+                    self.krx_name_to_code = {
+                        str(row["종목명"]).strip(): str(row["종목코드"]).zfill(6)
+                        for _, row in krx_listing.iterrows()
+                    }
+                    self.krx_code_to_name = {
+                        code: name for name, code in self.krx_name_to_code.items()
+                    }
+                    self.krx_codes = set(self.krx_code_to_name.keys())
+                    print(f"self.krx_codes : {len(self.krx_codes)}")
+                else:
+                    self.krx_codes = set()
+                # krx_listing = fdr.StockListing("KRX-DESC")
+                # print(f"krx_listing: {krx_listing}")
+                # self.krx_codes = set(krx_listing["Symbol"].astype(str)) if not krx_listing.empty else set()
+            except Exception as e:
+                print(f"KRX 상장 목록 조회 실패 (FinanceDataReader): {e}")
+                self.krx_codes = set()
 
     def load_interest_stocks(self):
         try:
             with open(INTEREST_STOCKS_FILE, "r") as f:
-                return json.load(f)
+                data = json.load(f)
+                # 이전 형식(list)과 신규 형식(dict)을 모두 지원
+                if isinstance(data, list):
+                    return {"default": data}
+                if isinstance(data, dict):
+                    # 키를 문자열로 정규화
+                    return {str(k): v for k, v in data.items()}
+                return {}
+        except json.JSONDecodeError:
+            # 파일이 비어있거나 잘못된 JSON일 때는 초기화해 안전하게 진행
+            print(f"관심 종목 파일이 올바르지 않아 초기화합니다: {INTEREST_STOCKS_FILE}")
+            return {}
         except FileNotFoundError:
-            return []
+            return {}
 
     def save_interest_stocks(self):
         with open(INTEREST_STOCKS_FILE, "w") as f:
             json.dump(self.interest_stocks, f)
+
+    def get_user_interest_stocks(self, chat_id) -> list:
+        chat_key = str(chat_id)
+        return list(self.interest_stocks.get(chat_key, []))
+
+    def set_user_interest_stocks(self, chat_id, stocks: list):
+        chat_key = str(chat_id)
+        self.interest_stocks[chat_key] = stocks
+        self.save_interest_stocks()
 
     def is_valid_ticker(self, ticker: str) -> bool:
         # 1차: 상장 목록에 있는지 확인
@@ -87,38 +134,91 @@ class StockNewsBot:
         ticker_upper = str(ticker).upper()
         if ticker_upper in self.nasdaq_symbols or ticker_upper in self.nyse_symbols:
             return "$"
-        if ticker in self.krx_symbols or ticker.isdigit():
+        if ticker in self.krx_codes or ticker.isdigit():
             return "원"
         return "원"
+
+    def resolve_ticker_input(self, user_input: str):
+        """
+        사용자 입력(종목코드 또는 한글명)을 실제 티커 코드로 변환한다.
+        Returns (ticker, resolved_name, candidates)
+        """
+        query = (user_input or "").strip()
+        if not query:
+            return None, None, None
+
+        # 숫자 입력은 KRX 코드로 간주하고 6자리로 보정
+        if query.isdigit():
+            ticker = query.zfill(6)
+            name = self.krx_code_to_name.get(ticker)
+            return ticker, name, None
+
+        # KRX 종목명 검색 (정확 일치 우선, 부분 일치 보조)
+        if self.krx_name_to_code:
+            if query in self.krx_name_to_code:
+                ticker = self.krx_name_to_code[query]
+                return ticker, query, None
+
+            candidates = [
+                (name, code)
+                for name, code in self.krx_name_to_code.items()
+                if query in name
+            ]
+            if len(candidates) == 1:
+                name, code = candidates[0]
+                return code, name, None
+            if len(candidates) > 1:
+                return None, None, candidates
+
+        # 해외 티커 등은 그대로 반환하되 대문자로 통일
+        return query.upper(), None, None
 
     # 핸들러들
     async def add_stock(self, update, context: ContextTypes.DEFAULT_TYPE):
         if not context.args:
             return await update.message.reply_text("사용법: /add 005930")
-        ticker = context.args[0]
+        chat_id = update.effective_chat.id if update and update.effective_chat else "default"
+        interest_list = self.get_user_interest_stocks(chat_id)
+        ticker, resolved_name, candidates = self.resolve_ticker_input(context.args[0])
+        if candidates:
+            suggestions = "\n".join(
+                f"- {name} ({code})" for name, code in candidates[:5]
+            )
+            return await update.message.reply_text(
+                "여러 종목이 검색되었습니다. 정확한 종목명을 입력해주세요:\n" + suggestions
+            )
+        if not ticker:
+            return await update.message.reply_text("올바른 종목명을 입력해주세요.")
         if not self.is_valid_ticker(ticker):
             return await update.message.reply_text("존재하지 않는 종목입니다.")
-        if ticker in self.interest_stocks:
+        if ticker in interest_list:
             return await update.message.reply_text("이미 추가된 종목입니다.")
-        self.interest_stocks.append(ticker)
-        self.save_interest_stocks()
-        await update.message.reply_text(f"{ticker} 추가 완료.")
+        interest_list.append(ticker)
+        self.set_user_interest_stocks(chat_id, interest_list)
+        name_text = f"{resolved_name} ({ticker})" if resolved_name else ticker
+        await update.message.reply_text(f"{name_text} 추가 완료.")
 
     async def remove_stock(self, update, context: ContextTypes.DEFAULT_TYPE):
         if not context.args:
             return await update.message.reply_text("사용법: /remove 005930")
+        chat_id = update.effective_chat.id if update and update.effective_chat else "default"
+        interest_list = self.get_user_interest_stocks(chat_id)
         ticker = context.args[0]
-        if ticker not in self.interest_stocks:
+        if ticker not in interest_list:
             return await update.message.reply_text("목록에 없는 종목입니다.")
-        self.interest_stocks = [code for code in self.interest_stocks if code != ticker]
-        self.save_interest_stocks()
+        new_list = [code for code in interest_list if code != ticker]
+        self.set_user_interest_stocks(chat_id, new_list)
         await update.message.reply_text(f"{ticker} 삭제 완료.")
 
     async def list_stocks(self, update, context):
-        await update.message.reply_text(", ".join(self.interest_stocks) or "비어있음")
+        chat_id = update.effective_chat.id if update and update.effective_chat else "default"
+        interest_list = self.get_user_interest_stocks(chat_id)
+        await update.message.reply_text(", ".join(interest_list) or "비어있음")
 
     async def report_command(self, update, context):
-        report = self.create_report()
+        chat_id = update.effective_chat.id if update and update.effective_chat else "default"
+        interest_stocks = self.get_user_interest_stocks(chat_id)
+        report = self.create_report(interest_stocks)
         print(f"\n생성된 리포트:\n {report}")
         await update.message.reply_text(report)
 
@@ -165,6 +265,8 @@ class StockNewsBot:
 
     def get_stock_name(self, ticker: str) -> str:
         """티커에 해당하는 종목명 조회"""
+        if ticker in self.krx_code_to_name:
+            return self.krx_code_to_name[ticker]
         if self.listing is None:
             return ticker
 
@@ -273,8 +375,8 @@ class StockNewsBot:
         except Exception as e:
             print(f"텔레그램 전송 실패: {e}")
 
-    def create_report(self):
-        """시황 리포트 생성"""
+    def create_report(self, interest_stocks: list):
+        """시황 리포트 생성 (사용자별 관심종목 리스트 사용)"""
         kst = ZoneInfo("Asia/Seoul")
         kst_now = datetime.now(kst)
         report = f"📊 오늘의 주식 시황 ({kst_now.strftime('%Y-%m-%d %H:%M')})\n\n"
@@ -284,10 +386,10 @@ class StockNewsBot:
         report += "🎯 관심 종목\n"
         report += "=" * 30 + "\n"
 
-        if not self.interest_stocks:
+        if not interest_stocks:
             report += "\n등록된 관심 종목이 없습니다. /add <티커>로 추가하세요.\n"
 
-        for ticker in self.interest_stocks:
+        for ticker in interest_stocks:
             info = self.get_stock_info(ticker)
             print(f"info: {info}")
             if not info:
@@ -335,7 +437,8 @@ class StockNewsBot:
         # post_init 훅에서 최초 리포트를 전송하도록 설정합니다.
 
         async def _post_init(app: Application):
-            report = self.create_report()
+            default_interest = self.get_user_interest_stocks(TELEGRAM_CHAT_ID)
+            report = self.create_report(default_interest)
             print("\n생성된 리포트:\n")
             print(report)
             print("\n텔레그램 전송 중...")
