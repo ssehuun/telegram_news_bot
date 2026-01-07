@@ -19,7 +19,7 @@ INTEREST_STOCKS_FILE = "./interest_stocks.json"
 
 # 설정
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "default_user")
 
 
@@ -34,8 +34,8 @@ class StockNewsBot:
         self.interest_stocks = self.load_interest_stocks()
         self.application: Optional[Application] = None
         self.listing = None
-        # self.nasdaq_symbols: Set[str] = set()
-        # self.nyse_symbols: Set[str] = set()
+        self.nasdaq_symbols: Set[str] = set()
+        self.nyse_symbols: Set[str] = set()
         self.krx_codes: Set[str] = set()
         self.krx_name_to_code: Dict[str, str] = {}
         self.krx_code_to_name: Dict[str, str] = {}
@@ -88,9 +88,6 @@ class StockNewsBot:
         try:
             with open(INTEREST_STOCKS_FILE, "r") as f:
                 data = json.load(f)
-                # 이전 형식(list)과 신규 형식(dict)을 모두 지원
-                if isinstance(data, list):
-                    return {"default": data}
                 if isinstance(data, dict):
                     # 키를 문자열로 정규화
                     return {str(k): v for k, v in data.items()}
@@ -203,27 +200,49 @@ class StockNewsBot:
             return await update.message.reply_text("사용법: /remove 005930")
         chat_id = update.effective_chat.id if update and update.effective_chat else "default"
         interest_list = self.get_user_interest_stocks(chat_id)
-        ticker = context.args[0]
-        if ticker not in interest_list:
+        ticker, resolved_name, candidates = self.resolve_ticker_input(context.args[0])
+        if candidates:
+            suggestions = "\n".join(
+                f"- {name} ({code})" for name, code in candidates[:5]
+            )
+            return await update.message.reply_text(
+                "여러 종목이 검색되었습니다. 정확한 종목명을 입력해주세요:\n" + suggestions
+            )
+        if not ticker or ticker not in interest_list:
             return await update.message.reply_text("목록에 없는 종목입니다.")
         new_list = [code for code in interest_list if code != ticker]
         self.set_user_interest_stocks(chat_id, new_list)
-        await update.message.reply_text(f"{ticker} 삭제 완료.")
+        name_text = f"{resolved_name} ({ticker})" if resolved_name else ticker
+        await update.message.reply_text(f"{name_text} 삭제 완료.")
+
+    async def help_command(self, update, context):
+        message = (
+            "안녕하세요! 사용할 수 있는 명령어 안내입니다.\n"
+            "/add <종목코드 또는 종목명> - 관심 종목 추가\n"
+            "/remove <종목코드 또는 종목명> - 관심 종목 삭제\n"
+            "/list - 관심 종목 목록 보기\n"
+            "/report - 관심 종목 리포트 생성"
+        )
+        await update.message.reply_text(message)
 
     async def list_stocks(self, update, context):
         chat_id = update.effective_chat.id if update and update.effective_chat else "default"
         interest_list = self.get_user_interest_stocks(chat_id)
-        await update.message.reply_text(", ".join(interest_list) or "비어있음")
+        if not interest_list:
+            return await update.message.reply_text("비어있음")
+        display_names = [self.get_stock_name(ticker) for ticker in interest_list]
+        await update.message.reply_text(", ".join(display_names))
 
     async def report_command(self, update, context):
         chat_id = update.effective_chat.id if update and update.effective_chat else "default"
-        interest_stocks = self.get_user_interest_stocks(chat_id)
-        report = self.create_report(interest_stocks)
+        interest_list = self.get_user_interest_stocks(chat_id)
+        report = self.create_report(interest_list)
         print(f"\n생성된 리포트:\n {report}")
         await update.message.reply_text(report)
 
     def build_application(self) -> Application:
         app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+        app.add_handler(CommandHandler("help", self.help_command))
         app.add_handler(CommandHandler("add", self.add_stock))
         app.add_handler(CommandHandler("remove", self.remove_stock))
         app.add_handler(CommandHandler("list", self.list_stocks))
@@ -362,11 +381,11 @@ class StockNewsBot:
         )
         return ranked[:3]
 
-    async def send_telegram_message(self, message):
+    async def send_telegram_message(self, chat_id, message):
         """텔레그램 메시지 전송"""
         try:
             await self.bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID,
+                chat_id=chat_id,
                 text=message,
                 parse_mode=None,  # 사용자 입력/요약에 HTML 태그가 섞일 수 있어 파싱 비활성화
                 disable_web_page_preview=False,
@@ -387,7 +406,7 @@ class StockNewsBot:
         report += "=" * 30 + "\n"
 
         if not interest_stocks:
-            report += "\n등록된 관심 종목이 없습니다. /add <티커>로 추가하세요.\n"
+            report += "\n등록된 관심 종목이 없습니다. /add <종목코드 또는 종목명>로 추가하세요.\n"
 
         for ticker in interest_stocks:
             info = self.get_stock_info(ticker)
@@ -434,24 +453,6 @@ class StockNewsBot:
         print("주식 시황 분석 시작 (텔레그램 폴링 모드)...")
         self.application = self.build_application()
         # run_polling은 내부에서 initialize/start/polling/idle/stop/shutdown 순서를 처리합니다.
-        # post_init 훅에서 최초 리포트를 전송하도록 설정합니다.
-
-        async def _post_init(app: Application):
-            default_interest = self.get_user_interest_stocks(TELEGRAM_CHAT_ID)
-            report = self.create_report(default_interest)
-            print("\n생성된 리포트:\n")
-            print(report)
-            print("\n텔레그램 전송 중...")
-            # 애플리케이션이 가진 Bot 인스턴스를 사용해 전송
-            await app.bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID,
-                text=report,
-                parse_mode=None,
-                disable_web_page_preview=False,
-            )
-            print("텔레그램 명령 대기 중 (/add, /remove, /list, /report)...")
-
-        self.application.post_init = _post_init
         # stop_signals=None 을 주면 Windows 등에서 add_signal_handler 없는 경우를 피할 수 있습니다.
         self.application.run_polling(stop_signals=None)
 
