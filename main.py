@@ -1,4 +1,5 @@
 import asyncio
+import atexit
 import json
 import os
 from datetime import datetime, timedelta
@@ -19,7 +20,6 @@ INTEREST_STOCKS_FILE = "./interest_stocks.json"
 
 # 설정
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "default_user")
 
 
@@ -39,6 +39,8 @@ class StockNewsBot:
         self.krx_codes: Set[str] = set()
         self.krx_name_to_code: Dict[str, str] = {}
         self.krx_code_to_name: Dict[str, str] = {}
+        self.default_chat_id: Optional[int] = None
+        self.lock_file_handle = None
 
         """
         try:
@@ -215,15 +217,22 @@ class StockNewsBot:
         name_text = f"{resolved_name} ({ticker})" if resolved_name else ticker
         await update.message.reply_text(f"{name_text} 삭제 완료.")
 
-    async def help_command(self, update, context):
-        message = (
+    def _get_help_message(self) -> str:
+        return (
             "안녕하세요! 사용할 수 있는 명령어 안내입니다.\n"
             "/add <종목코드 또는 종목명> - 관심 종목 추가\n"
             "/remove <종목코드 또는 종목명> - 관심 종목 삭제\n"
             "/list - 관심 종목 목록 보기\n"
             "/report - 관심 종목 리포트 생성"
         )
-        await update.message.reply_text(message)
+
+    async def start_command(self, update, context):
+        if update and update.effective_chat:
+            self.default_chat_id = update.effective_chat.id
+        await update.message.reply_text(self._get_help_message())
+
+    async def help_command(self, update, context):
+        await update.message.reply_text(self._get_help_message())
 
     async def list_stocks(self, update, context):
         chat_id = update.effective_chat.id if update and update.effective_chat else "default"
@@ -242,6 +251,7 @@ class StockNewsBot:
 
     def build_application(self) -> Application:
         app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+        app.add_handler(CommandHandler("start", self.start_command))
         app.add_handler(CommandHandler("help", self.help_command))
         app.add_handler(CommandHandler("add", self.add_stock))
         app.add_handler(CommandHandler("remove", self.remove_stock))
@@ -384,8 +394,12 @@ class StockNewsBot:
     async def send_telegram_message(self, chat_id, message):
         """텔레그램 메시지 전송"""
         try:
+            target_chat_id = chat_id or self.default_chat_id
+            if not target_chat_id:
+                print("chat_id가 설정되지 않아 텔레그램 메시지를 전송할 수 없습니다.")
+                return
             await self.bot.send_message(
-                chat_id=chat_id,
+                chat_id=target_chat_id,
                 text=message,
                 parse_mode=None,  # 사용자 입력/요약에 HTML 태그가 섞일 수 있어 파싱 비활성화
                 disable_web_page_preview=False,
@@ -448,8 +462,42 @@ class StockNewsBot:
 
         return report
 
+    def acquire_lock(self) -> bool:
+        """중복 실행 방지를 위한 락파일 확보"""
+        lock_path = os.path.join(os.path.dirname(__file__), ".bot.lock")
+        try:
+            self.lock_file_handle = open(lock_path, "w")
+            try:
+                import fcntl
+                fcntl.flock(self.lock_file_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                print("이미 실행 중인 봇 인스턴스가 있습니다. 현재 실행을 중단합니다.")
+                return False
+            self.lock_file_handle.write(str(os.getpid()))
+            self.lock_file_handle.flush()
+            atexit.register(self.release_lock)
+            return True
+        except Exception as e:
+            print(f"락파일 확보 실패: {e}")
+            return False
+
+    def release_lock(self):
+        if not self.lock_file_handle:
+            return
+        try:
+            try:
+                import fcntl
+                fcntl.flock(self.lock_file_handle, fcntl.LOCK_UN)
+            finally:
+                self.lock_file_handle.close()
+                self.lock_file_handle = None
+        except Exception:
+            pass
+
     def run(self):
         """메인 실행 함수"""
+        if not self.acquire_lock():
+            return
         print("주식 시황 분석 시작 (텔레그램 폴링 모드)...")
         self.application = self.build_application()
         # run_polling은 내부에서 initialize/start/polling/idle/stop/shutdown 순서를 처리합니다.

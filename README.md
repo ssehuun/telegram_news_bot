@@ -13,8 +13,6 @@ Telegram bot that tracks 관심 종목 and sends a simple market report on deman
 ```env
 TELEGRAM_BOT_TOKEN=YOUR_TELEGRAM_BOT_TOKEN
 OPENAI_API_KEY=YOUR_OPENAI_API_KEY
-# Optional: preconfigured chat id for internal testing
-TELEGRAM_CHAT_ID=
 # Optional: skip loading KRX listing CSV
 SKIP_KRX_LISTING=false
 ```
